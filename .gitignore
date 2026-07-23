@@ -5,3 +5,7 @@ __pycache__/
 *.egg-info/
 
 PRD_Registration_Testing_Tool.docx
+.env
+logs/
+rules_*.json
+build_*.log

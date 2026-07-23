@@ -33,6 +33,9 @@ _SOW_HEADER_ALIASES = {
     "input method": "input_method",
     "values": "values",
     "default value": "default",
+    "validations": "validations",
+    "help text": "help_text",
+    "addl remarks": "addl_remarks",
 }
 
 _TYPE_MAP = {
@@ -118,6 +121,60 @@ def _header_row_map(row: tuple) -> dict[str, int]:
     return out
 
 
+def _rows_with_vertical_merges_filled(ws) -> list[list]:
+    """Read a worksheet's values, filling every VERTICAL merged range down.
+
+    A validation/values cell is often merged across the several rows it
+    governs (e.g. NITR Basic Details I16:I17, I35:I37) — openpyxl only
+    reports the value in the top-left cell, so the other rows would read
+    None and their fields would lose the rule that applies to them.
+
+    Only vertical merges (single column, multiple rows) are filled: their
+    meaning is "this value applies to all these rows". Horizontal merges
+    (e.g. the A2:K2 section-header banners) are left untouched — spreading
+    a section title across Type/Mandatory/etc. would corrupt those columns
+    and defeat the blank-Mandatory row-skip.
+    """
+    grid = [list(row) for row in ws.iter_rows(values_only=True)]
+    for rng in ws.merged_cells.ranges:
+        if rng.min_col == rng.max_col and rng.max_row > rng.min_row:
+            col = rng.min_col - 1  # openpyxl is 1-based; grid is 0-based
+            top_value = grid[rng.min_row - 1][col]
+            for r in range(rng.min_row, rng.max_row):  # rows below the top
+                if r < len(grid) and col < len(grid[r]):
+                    grid[r][col] = top_value
+    return grid
+
+
+def _iter_sow_rows(path: str | Path, sheet_name: str):
+    """Yield (row_num, get, mandatory_raw, label) for every row of a SOW sheet.
+
+    `get(column_name)` looks up a cell in the current row by canonical
+    column name (see _SOW_HEADER_ALIASES), regardless of its position.
+    Shared by parse_sow_sheet and parse_sow_sheet_with_prose so the header
+    lookup / row-scan logic lives in exactly one place. Vertical merged
+    cells are filled down first (see _rows_with_vertical_merges_filled).
+    """
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = wb[sheet_name]
+
+    rows = _rows_with_vertical_merges_filled(ws)
+    if not rows:
+        return
+    columns = _header_row_map(rows[0])
+    required = {"sl", "label", "type", "mandatory", "input_method"}
+    missing = required - columns.keys()
+    if missing:
+        raise ValueError(f"{sheet_name}: SOW header missing columns {sorted(missing)}")
+
+    for row_num, row in enumerate(rows[1:], start=2):
+        def get(name: str, row=row):
+            idx = columns.get(name)
+            return row[idx] if idx is not None else None
+
+        yield row_num, get, get("mandatory"), get("label")
+
+
 def parse_sow_sheet(path: str | Path, sheet_name: str) -> tuple[list[Field], list[dict]]:
     """Parse one SOW sheet's clean columns into Field objects.
 
@@ -128,31 +185,13 @@ def parse_sow_sheet(path: str | Path, sheet_name: str) -> tuple[list[Field], lis
     reported in the second return value, since a field with no label can
     never be resolved on the live page.
     """
-    wb = openpyxl.load_workbook(path, data_only=True)
-    ws = wb[sheet_name]
-
-    rows = list(ws.iter_rows(values_only=True))
-    if not rows:
-        return [], []
-    columns = _header_row_map(rows[0])
-    required = {"sl", "label", "type", "mandatory", "input_method"}
-    missing = required - columns.keys()
-    if missing:
-        raise ValueError(f"{sheet_name}: SOW header missing columns {sorted(missing)}")
-
     fields: list[Field] = []
     skipped: list[dict] = []
 
-    for row_num, row in enumerate(rows[1:], start=2):
-        def get(name: str):
-            idx = columns.get(name)
-            return row[idx] if idx is not None else None
-
-        mandatory_raw = get("mandatory")
+    for row_num, get, mandatory_raw, label in _iter_sow_rows(path, sheet_name):
         if mandatory_raw is None or str(mandatory_raw).strip() == "":
             continue  # section header / note / non-field row
 
-        label = get("label")
         if label is None or str(label).strip() == "":
             skipped.append(
                 {"sheet": sheet_name, "row": row_num, "sl": get("sl"), "reason": "missing_label"}
@@ -179,6 +218,32 @@ def parse_sow_sheet(path: str | Path, sheet_name: str) -> tuple[list[Field], lis
         )
 
     return fields, skipped
+
+
+def parse_sow_sheet_with_prose(
+    path: str | Path, sheet_name: str
+) -> tuple[list[Field], list[dict], dict[str, dict]]:
+    """Like parse_sow_sheet, but also returns each kept field's raw prose.
+
+    The third return value maps Field.sl -> {"values": str|None,
+    "validations": str|None} — the free-text columns parse_sow_sheet never
+    reads. This is the input the LLM-assisted validation_extractor needs;
+    keeping it out of parse_sow_sheet's own return value avoids disturbing
+    every existing caller/test of the columnar parser.
+    """
+    fields, skipped = parse_sow_sheet(path, sheet_name)
+    prose_by_sl: dict[str, dict] = {}
+    for _row_num, get, mandatory_raw, label in _iter_sow_rows(path, sheet_name):
+        if mandatory_raw is None or str(mandatory_raw).strip() == "":
+            continue
+        if label is None or str(label).strip() == "":
+            continue
+        sl = _normalize_sl(get("sl"))
+        prose_by_sl[sl] = {
+            "values": get("values"),
+            "validations": get("validations"),
+        }
+    return fields, skipped, prose_by_sl
 
 
 # A simple quoted/comma-separated list, e.g. "('SC','ST','OBC','EWS','UR')" or
@@ -268,6 +333,20 @@ def _parse_relaxation_grid(rows: list[tuple], header_idx: int):
         }
         i += 1
     return categories, by_label, i
+
+
+def get_age_as_on_date(path: str | Path) -> date | None:
+    """Return the "Age as on" reference date (assumed uniform across every
+    sheet of one age-criteria workbook — one recruitment, one cut-off date).
+    """
+    wb = openpyxl.load_workbook(path, data_only=True)
+    for sheet_name in wb.sheetnames:
+        rows = list(wb[sheet_name].iter_rows(values_only=True))
+        found = _find_label_value(rows, 0, len(rows), "Age as on", 3)
+        result = _to_date(found)
+        if result is not None:
+            return result
+    return None
 
 
 def parse_age_criteria(path: str | Path) -> tuple[dict[str, AgeRule], dict[str, list[str]]]:

@@ -77,7 +77,13 @@ class Field(BaseModel):
     default: str | None = None
     uppercase: bool | None = None
     must_equal: str | None = None
-    enabled_when: str = "always"
+    # Absent (None) means "always enabled" — the engine treats a missing
+    # enabled_when as always. We store None rather than the literal "always"
+    # so it isn't emitted on every field (which read as a contradiction on
+    # conditionally-enabled fields, whose real condition lives in
+    # `conditional`). Set only when a field is enabled by a simple standing
+    # expression that isn't better expressed via `conditional`.
+    enabled_when: str | None = None
     conditional: Conditional | None = None
     source: Source
     confidence: Confidence | None = None

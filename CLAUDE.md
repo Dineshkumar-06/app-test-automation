@@ -21,14 +21,14 @@ an LLM "did this field pass?", stop — that logic belongs in the engine.
 1. **Rule extraction (`extractor/`)** — reads the SOW, age, and eligibility workbooks and emits
    `rules.json`. Clean columns (Type, Max Length, Mandatory, Input Method) are parsed
    deterministically with openpyxl/pandas — no LLM. Only the free-text `Validations`/`Values`
-   prose goes through the Anthropic API, and each interpreted rule gets a `confidence` tag and a
-   `source` (sheet+row).
+   prose goes through the LLM (via `extractor/llm.py`), and each interpreted rule gets a
+   `confidence` tag and a `source` (sheet+row).
 2. **Execution engine (`engine/`)** — Python + Playwright. Resolves fields by label, then runs
    validation, conditional-logic, cross-document, save/back, and monkey checks. Fully
    deterministic. Emits a structured result set (`results.json`).
-3. **Report generation (`report/`)** — turns `results.json` into HTML + xlsx. May use the
-   Anthropic API to phrase issues and draft clarification questions, but must not add, remove,
-   or change any verdict.
+3. **Report generation (`report/`)** — turns `results.json` into HTML + xlsx. May use the LLM
+   (via `extractor/llm.py`) to phrase issues and draft clarification questions, but must not add,
+   remove, or change any verdict.
 
 ## Input documents (see rules.schema.md for detail)
 
@@ -73,8 +73,11 @@ artifact and is rebuilt every run. Assertions reference labels only.
 ## Tech stack
 
 - Python 3.11+, Playwright (sync API is fine), openpyxl, pandas.
-- Anthropic API via the official SDK. Model calls only in `extractor/` and `report/`.
-  Constrain prompts to emit JSON only; parse defensively; retry on malformed output.
+- LLM access is NVIDIA's OpenAI-compatible API, via the `openai` SDK, through the single
+  `call_llm(system, user)` choke point in `extractor/llm.py`. Nothing else imports the SDK
+  directly — swapping models or providers stays a one-line change there. Model calls only
+  happen in `extractor/` and `report/`. Constrain prompts to emit JSON only; parse defensively;
+  retry on malformed output.
 - CLI entry point: `python -m tool run --url <link> --docs <dir> --page reg_details --out <dir>`.
 
 ## Human-gated pages
@@ -103,6 +106,7 @@ the `reg_details.php?q=...` link from a manually created entry). Take that link 
   rejects everything is as much a bug as one that accepts everything.
 - Client-side and server-side validation are asserted independently (submit to force server
   round-trip where client validation might mask it).
-- No secrets in the repo. Anthropic API key from environment (`ANTHROPIC_API_KEY`).
+- No secrets in the repo. NVIDIA API key from environment (`NVIDIA_API_KEY`), loaded from a
+  local `.env` (gitignored) via `python-dotenv` — never hardcoded, never committed.
 - Keep the engine dumb and the rules expressive: interpretation lives in `rules.json`, never in
   engine branches.
